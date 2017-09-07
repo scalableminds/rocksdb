@@ -36,6 +36,10 @@
 #include "util/string_util.h"
 #include "utilities/ttl/db_ttl_impl.h"
 
+#include <google/protobuf/compiler/importer.h>
+#include <google/protobuf/dynamic_message.h>
+#include <google/protobuf/text_format.h>
+
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
@@ -45,6 +49,12 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+
+class ErrorCollector : public google::protobuf::compiler::MultiFileErrorCollector {
+    void AddError(const std::string & filename, int line, int column, const std::string & message) {
+      std::cerr << "Error reading '" << filename << ":" << line << ":" << column << "' - " << message << std::endl;
+    }
+};
 
 namespace rocksdb {
 
@@ -76,6 +86,8 @@ const std::string LDBCommand::ARG_WRITE_BUFFER_SIZE = "write_buffer_size";
 const std::string LDBCommand::ARG_FILE_SIZE = "file_size";
 const std::string LDBCommand::ARG_CREATE_IF_MISSING = "create_if_missing";
 const std::string LDBCommand::ARG_NO_VALUE = "no_value";
+const std::string LDBCommand::ARG_PROTO = "proto";
+const std::string LDBCommand::ARG_PROTO_FILE = "proto_file";
 
 const char* LDBCommand::DELIM = " ==> ";
 
@@ -495,6 +507,20 @@ bool LDBCommand::ParseStringOption(
     return true;
   }
   return false;
+}
+
+bool LDBCommand::ParseProtobuf(const std::string &proto, const std::string &proto_file, const Slice &slice, std::string &result) {
+  ErrorCollector error_collector;
+  google::protobuf::compiler::DiskSourceTree source_tree;
+  source_tree.MapPath("", ".");
+  google::protobuf::compiler::Importer importer(&source_tree, &error_collector);
+  const google::protobuf::FileDescriptor* file_descriptor = importer.Import(proto_file);
+  const google::protobuf::Descriptor* descriptor = file_descriptor->FindMessageTypeByName(proto);
+  google::protobuf::DynamicMessageFactory factory;
+  google::protobuf::Message* message = factory.GetPrototype(descriptor)->New();
+  message->ParseFromArray(slice.data(), slice.size());
+  result = message->ShortDebugString();
+  return true;
 }
 
 Options LDBCommand::PrepareOptionsForOpenDB() {
@@ -2035,7 +2061,7 @@ GetCommand::GetCommand(const std::vector<std::string>& params,
                        const std::vector<std::string>& flags)
     : LDBCommand(
           options, flags, true,
-          BuildCmdLineOptions({ARG_TTL, ARG_HEX, ARG_KEY_HEX, ARG_VALUE_HEX})) {
+          BuildCmdLineOptions({ARG_TTL, ARG_HEX, ARG_KEY_HEX, ARG_VALUE_HEX, ARG_PROTO, ARG_PROTO_FILE})) {
   if (params.size() != 1) {
     exec_state_ = LDBCommandExecuteResult::Failed(
         "<key> must be specified for the get command");
@@ -2053,6 +2079,8 @@ void GetCommand::Help(std::string& ret) {
   ret.append(GetCommand::Name());
   ret.append(" <key>");
   ret.append(" [--" + ARG_TTL + "]");
+  ret.append(" [--" + ARG_PROTO + "]");
+  ret.append(" [--" + ARG_PROTO_FILE + "]");
   ret.append("\n");
 }
 
@@ -2061,11 +2089,29 @@ void GetCommand::DoCommand() {
     assert(GetExecuteState().IsFailed());
     return;
   }
+
+  std::string proto;
+  std::string proto_file;
+  bool _has_proto = ParseStringOption(option_map_, ARG_PROTO, &proto);
+  bool _has_proto_file = ParseStringOption(option_map_, ARG_PROTO_FILE, &proto_file);
+  if (_has_proto != _has_proto_file) {
+    fprintf(stderr, "Error: Specify both a proto and a proto file");
+    return;
+  }
+  if (_has_proto && is_value_hex_) {
+    fprintf(stderr, "Error: Output cannot be both hex and proto");
+    return;
+  }
+
   std::string value;
   Status st = db_->Get(ReadOptions(), GetCfHandle(), key_, &value);
   if (st.ok()) {
-    fprintf(stdout, "%s\n",
-              (is_value_hex_ ? StringToHex(value) : value).c_str());
+    if (is_value_hex_) {
+      value = StringToHex(value);
+    } else if (_has_proto) {
+      ParseProtobuf(proto, proto_file, value, value);
+    }
+    fprintf(stdout, "%s\n", value.c_str());
   } else {
     exec_state_ = LDBCommandExecuteResult::Failed(st.ToString());
   }
@@ -2197,7 +2243,7 @@ ScanCommand::ScanCommand(const std::vector<std::string>& params,
           options, flags, true,
           BuildCmdLineOptions({ARG_TTL, ARG_NO_VALUE, ARG_HEX, ARG_KEY_HEX,
                                ARG_TO, ARG_VALUE_HEX, ARG_FROM, ARG_TIMESTAMP,
-                               ARG_MAX_KEYS, ARG_TTL_START, ARG_TTL_END})),
+                               ARG_MAX_KEYS, ARG_TTL_START, ARG_TTL_END, ARG_PROTO, ARG_PROTO_FILE})),
       start_key_specified_(false),
       end_key_specified_(false),
       max_keys_scanned_(-1),
@@ -2254,6 +2300,8 @@ void ScanCommand::Help(std::string& ret) {
   ret.append(" [--" + ARG_TTL_START + "=<N>:- is inclusive]");
   ret.append(" [--" + ARG_TTL_END + "=<N>:- is exclusive]");
   ret.append(" [--" + ARG_NO_VALUE + "]");
+  ret.append(" [--" + ARG_PROTO + "]");
+  ret.append(" [--" + ARG_PROTO_FILE + "]");
   ret.append("\n");
 }
 
@@ -2287,6 +2335,21 @@ void ScanCommand::DoCommand() {
     fprintf(stdout, "Scanning key-values from %s to %s\n",
             ReadableTime(ttl_start).c_str(), ReadableTime(ttl_end).c_str());
   }
+  std::string proto;
+  std::string proto_file;
+  bool _has_proto = ParseStringOption(option_map_, ARG_PROTO, &proto);
+  bool _has_proto_file = ParseStringOption(option_map_, ARG_PROTO_FILE, &proto_file);
+  if (_has_proto != _has_proto_file) {
+    fprintf(stderr, "Error: Specify both a proto and a proto file");
+    delete it;
+    return;
+  }
+  if (_has_proto && is_value_hex_) {
+    fprintf(stderr, "Error: Output cannot be both hex and proto");
+    delete it;
+    return;
+  }
+
   for ( ;
         it->Valid() && (!end_key_specified_ || it->key().ToString() < end_key_);
         it->Next()) {
@@ -2318,10 +2381,14 @@ void ScanCommand::DoCommand() {
     } else {
       Slice val_slice = it->value();
       std::string formatted_value;
-      if (is_value_hex_) {
+      if (_has_proto) {
+        ParseProtobuf(proto, proto_file, val_slice, formatted_value);
+        val_slice = formatted_value;
+      } else if (is_value_hex_) {
         formatted_value = "0x" + val_slice.ToString(true /* hex */);
         val_slice = formatted_value;
       }
+
       fprintf(stdout, "%.*s : %.*s\n", static_cast<int>(key_slice.size()),
               key_slice.data(), static_cast<int>(val_slice.size()),
               val_slice.data());

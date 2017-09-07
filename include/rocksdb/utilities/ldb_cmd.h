@@ -55,6 +55,8 @@ class LDBCommand {
   static const std::string ARG_FILE_SIZE;
   static const std::string ARG_CREATE_IF_MISSING;
   static const std::string ARG_NO_VALUE;
+  static const std::string ARG_PROTO;
+  static const std::string ARG_PROTO_FILE;
 
   struct ParsedParams {
     std::string cmd;
@@ -209,6 +211,8 @@ class LDBCommand {
 
   bool ParseStringOption(const std::map<std::string, std::string>& options,
                          const std::string& option, std::string* value);
+
+  bool ParseProtobuf(const std::string &proto, const std::string &proto_file, const Slice &slice, std::string &result);
 
   Options options_;
   std::vector<ColumnFamilyDescriptor> column_families_;
