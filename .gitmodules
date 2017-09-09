@@ -1,0 +1,3 @@
+[submodule "third-party/json2pb"]
+	path = third-party/json2pb
+	url = git@github.com:shramov/json2pb.git
