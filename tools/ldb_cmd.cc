@@ -10,6 +10,7 @@
 #define __STDC_FORMAT_MACROS
 #endif
 
+#include <memory>
 #include <inttypes.h>
 
 #include "db/db_impl.h"
@@ -36,9 +37,7 @@
 #include "util/string_util.h"
 #include "utilities/ttl/db_ttl_impl.h"
 
-#include <google/protobuf/compiler/importer.h>
-#include <google/protobuf/dynamic_message.h>
-#include <google/protobuf/text_format.h>
+#include "third-party/json2pb/json2pb.h"
 
 #include <cstdlib>
 #include <ctime>
@@ -50,7 +49,7 @@
 #include <stdexcept>
 #include <string>
 
-class ErrorCollector : public google::protobuf::compiler::MultiFileErrorCollector {
+class ProtobufErrorCollector : public google::protobuf::compiler::MultiFileErrorCollector {
     void AddError(const std::string & filename, int line, int column, const std::string & message) {
       std::cerr << "Error reading '" << filename << ":" << line << ":" << column << "' - " << message << std::endl;
     }
@@ -294,6 +293,9 @@ LDBCommand::LDBCommand(const std::map<std::string, std::string>& options,
       is_read_only_(is_read_only),
       is_key_hex_(false),
       is_value_hex_(false),
+      is_value_proto_(false),
+      proto_(""),
+      proto_file_(""),
       is_db_ttl_(false),
       timestamp_(false),
       try_load_options_(false),
@@ -316,10 +318,15 @@ LDBCommand::LDBCommand(const std::map<std::string, std::string>& options,
 
   is_key_hex_ = IsKeyHex(options, flags);
   is_value_hex_ = IsValueHex(options, flags);
+  is_value_proto_ = ParseStringOption(options, ARG_PROTO, &proto_) && ParseStringOption(options, ARG_PROTO_FILE, &proto_file_);
   is_db_ttl_ = IsFlagPresent(flags, ARG_TTL);
   timestamp_ = IsFlagPresent(flags, ARG_TIMESTAMP);
   try_load_options_ = IsFlagPresent(flags, ARG_TRY_LOAD_OPTIONS);
   ignore_unknown_options_ = IsFlagPresent(flags, ARG_IGNORE_UNKNOWN_OPTIONS);
+
+  if (is_value_proto_) {
+    PrepareProtobufMessage();
+  }
 }
 
 void LDBCommand::OpenDB() {
@@ -509,20 +516,6 @@ bool LDBCommand::ParseStringOption(
   return false;
 }
 
-bool LDBCommand::ParseProtobuf(const std::string &proto, const std::string &proto_file, const Slice &slice, std::string &result) {
-  ErrorCollector error_collector;
-  google::protobuf::compiler::DiskSourceTree source_tree;
-  source_tree.MapPath("", ".");
-  google::protobuf::compiler::Importer importer(&source_tree, &error_collector);
-  const google::protobuf::FileDescriptor* file_descriptor = importer.Import(proto_file);
-  const google::protobuf::Descriptor* descriptor = file_descriptor->FindMessageTypeByName(proto);
-  google::protobuf::DynamicMessageFactory factory;
-  google::protobuf::Message* message = factory.GetPrototype(descriptor)->New();
-  message->ParseFromArray(slice.data(), slice.size());
-  result = message->ShortDebugString();
-  return true;
-}
-
 Options LDBCommand::PrepareOptionsForOpenDB() {
 
   Options opt = options_;
@@ -653,7 +646,7 @@ Options LDBCommand::PrepareOptionsForOpenDB() {
 
 bool LDBCommand::ParseKeyValue(const std::string& line, std::string* key,
                                std::string* value, bool is_key_hex,
-                               bool is_value_hex) {
+                               bool is_value_hex, bool is_value_proto) {
   size_t pos = line.find(DELIM);
   if (pos != std::string::npos) {
     *key = line.substr(0, pos);
@@ -663,6 +656,9 @@ bool LDBCommand::ParseKeyValue(const std::string& line, std::string* key,
     }
     if (is_value_hex) {
       *value = HexToString(*value);
+    }
+    if (is_value_proto) {
+      *value = ProtoToJson(*value);
     }
     return true;
   } else {
@@ -701,12 +697,42 @@ bool LDBCommand::ValidateCmdLineOptions() {
 
   if (!NoDBOpen() && option_map_.find(ARG_DB) == option_map_.end() &&
       option_map_.find(ARG_PATH) == option_map_.end()) {
-    fprintf(stderr, "Either %s or %s must be specified.\n", ARG_DB.c_str(),
+    fprintf(stderr, "Either %s or %s must be specified\n", ARG_DB.c_str(),
             ARG_PATH.c_str());
     return false;
   }
 
+  if (is_value_proto_ && is_value_hex_) {
+    fprintf(stderr, "Value format cannot be both %s and %s\n", ARG_HEX.c_str(), ARG_PROTO.c_str());
+    return false;
+  }
+
+  if ((option_map_.find(ARG_PROTO) == option_map_.end()) != (option_map_.find(ARG_PROTO_FILE) == option_map_.end())) {
+    fprintf(stderr, "Either both %s and %s or neither must be specified\n", ARG_PROTO.c_str(), ARG_PROTO_FILE.c_str());
+    return false;
+  }
+
   return true;
+}
+
+void LDBCommand::PrepareProtobufMessage() {
+  ProtobufErrorCollector error_collector;
+  google::protobuf::compiler::DiskSourceTree source_tree;
+
+  source_tree.MapPath("", ".");
+  proto_importer_ = std::make_shared<google::protobuf::compiler::Importer>(&source_tree, &error_collector);
+
+  proto_file_descriptor_ = proto_importer_->Import(proto_file_);
+  if (!proto_file_descriptor_) {
+    throw "Could not load protobuf file descriptor";
+  }
+
+  proto_descriptor_ = proto_file_descriptor_->FindMessageTypeByName(proto_);
+  if (!proto_descriptor_) {
+    throw "Could not load protobuf descriptor";
+  }
+
+  proto_message_ = std::shared_ptr<google::protobuf::Message>(proto_message_factory_.GetPrototype(proto_descriptor_)->New());
 }
 
 std::string LDBCommand::HexToString(const std::string& str) {
@@ -728,19 +754,40 @@ std::string LDBCommand::StringToHex(const std::string& str) {
   return result;
 }
 
-std::string LDBCommand::PrintKeyValue(const std::string& key,
-                                      const std::string& value, bool is_key_hex,
-                                      bool is_value_hex) {
+std::string LDBCommand::ProtoToJson(const std::string& str) {
+  proto_message_->ParseFromString(str);
+  return pb2json(*proto_message_);
+}
+
+std::string LDBCommand::JsonToProto(const std::string& str) {
+  json2pb(*proto_message_, str.data(), str.length());
   std::string result;
-  result.append(is_key_hex ? StringToHex(key) : key);
-  result.append(DELIM);
-  result.append(is_value_hex ? StringToHex(value) : value);
+  proto_message_->SerializeToString(&result);
+
+  if (!proto_message_->IsInitialized()) {
+    ProtoToJson(result);
+    fprintf(stderr, "Message has invalid format");
+    throw "Message has invalid format";
+  }
   return result;
 }
 
 std::string LDBCommand::PrintKeyValue(const std::string& key,
-                                      const std::string& value, bool is_hex) {
-  return PrintKeyValue(key, value, is_hex, is_hex);
+                                      const std::string& value,
+                                      bool is_key_hex,
+                                      bool is_value_hex,
+                                      bool is_value_proto) {
+  std::string result;
+  result.append(is_key_hex ? StringToHex(key) : key);
+  result.append(DELIM);
+  if (is_value_hex) {
+    result.append(StringToHex(value));
+  } else if (is_value_proto) {
+    result.append(ProtoToJson(value));
+  } else {
+    result.append(value);
+  }
+  return result;
 }
 
 std::string LDBCommand::HelpRangeCmdArgs() {
@@ -916,7 +963,7 @@ void DBLoaderCommand::DoCommand() {
   while (getline(*istream_p, line, '\n')) {
     std::string key;
     std::string value;
-    if (ParseKeyValue(line, &key, &value, is_key_hex_, is_value_hex_)) {
+    if (ParseKeyValue(line, &key, &value, is_key_hex_, is_value_hex_, is_value_proto_)) {
       db_->Put(write_options, GetCfHandle(), Slice(key), Slice(value));
     } else if (0 == line.find("Keys in range:")) {
       // ignore this line
@@ -1563,7 +1610,7 @@ void DBDumperCommand::DoDumpCommand() {
       }
       std::string str =
           PrintKeyValue(iter->key().ToString(), iter->value().ToString(),
-                        is_key_hex_, is_value_hex_);
+                        is_key_hex_, is_value_hex_, is_value_proto_);
       fprintf(stdout, "%s\n", str.c_str());
     }
   }
@@ -2090,26 +2137,13 @@ void GetCommand::DoCommand() {
     return;
   }
 
-  std::string proto;
-  std::string proto_file;
-  bool _has_proto = ParseStringOption(option_map_, ARG_PROTO, &proto);
-  bool _has_proto_file = ParseStringOption(option_map_, ARG_PROTO_FILE, &proto_file);
-  if (_has_proto != _has_proto_file) {
-    fprintf(stderr, "Error: Specify both a proto and a proto file");
-    return;
-  }
-  if (_has_proto && is_value_hex_) {
-    fprintf(stderr, "Error: Output cannot be both hex and proto");
-    return;
-  }
-
   std::string value;
   Status st = db_->Get(ReadOptions(), GetCfHandle(), key_, &value);
   if (st.ok()) {
     if (is_value_hex_) {
       value = StringToHex(value);
-    } else if (_has_proto) {
-      ParseProtobuf(proto, proto_file, value, value);
+    } else if (is_value_proto_) {
+      value = ProtoToJson(value);
     }
     fprintf(stdout, "%s\n", value.c_str());
   } else {
@@ -2181,7 +2215,7 @@ BatchPutCommand::BatchPutCommand(
     const std::vector<std::string>& flags)
     : LDBCommand(options, flags, false,
                  BuildCmdLineOptions({ARG_TTL, ARG_HEX, ARG_KEY_HEX,
-                                      ARG_VALUE_HEX, ARG_CREATE_IF_MISSING})) {
+                                      ARG_VALUE_HEX, ARG_CREATE_IF_MISSING, ARG_PROTO, ARG_PROTO_FILE})) {
   if (params.size() < 2) {
     exec_state_ = LDBCommandExecuteResult::Failed(
         "At least one <key> <value> pair must be specified batchput.");
@@ -2192,9 +2226,14 @@ BatchPutCommand::BatchPutCommand(
     for (size_t i = 0; i < params.size(); i += 2) {
       std::string key = params.at(i);
       std::string value = params.at(i + 1);
+      if (is_value_hex_) {
+        value = HexToString(value);
+      } else if (is_value_proto_) {
+        value = JsonToProto(value);
+      }
       key_values_.push_back(std::pair<std::string, std::string>(
           is_key_hex_ ? HexToString(key) : key,
-          is_value_hex_ ? HexToString(value) : value));
+          value));
     }
   }
   create_if_missing_ = IsFlagPresent(flags_, ARG_CREATE_IF_MISSING);
@@ -2205,6 +2244,8 @@ void BatchPutCommand::Help(std::string& ret) {
   ret.append(BatchPutCommand::Name());
   ret.append(" <key> <value> [<key> <value>] [..]");
   ret.append(" [--" + ARG_TTL + "]");
+  ret.append(" [--" + ARG_PROTO + "]");
+  ret.append(" [--" + ARG_PROTO_FILE + "]");
   ret.append("\n");
 }
 
@@ -2335,20 +2376,6 @@ void ScanCommand::DoCommand() {
     fprintf(stdout, "Scanning key-values from %s to %s\n",
             ReadableTime(ttl_start).c_str(), ReadableTime(ttl_end).c_str());
   }
-  std::string proto;
-  std::string proto_file;
-  bool _has_proto = ParseStringOption(option_map_, ARG_PROTO, &proto);
-  bool _has_proto_file = ParseStringOption(option_map_, ARG_PROTO_FILE, &proto_file);
-  if (_has_proto != _has_proto_file) {
-    fprintf(stderr, "Error: Specify both a proto and a proto file");
-    delete it;
-    return;
-  }
-  if (_has_proto && is_value_hex_) {
-    fprintf(stderr, "Error: Output cannot be both hex and proto");
-    delete it;
-    return;
-  }
 
   for ( ;
         it->Valid() && (!end_key_specified_ || it->key().ToString() < end_key_);
@@ -2381,12 +2408,11 @@ void ScanCommand::DoCommand() {
     } else {
       Slice val_slice = it->value();
       std::string formatted_value;
-      if (_has_proto) {
-        ParseProtobuf(proto, proto_file, val_slice, formatted_value);
-        val_slice = formatted_value;
-      } else if (is_value_hex_) {
+      if (is_value_hex_) {
         formatted_value = "0x" + val_slice.ToString(true /* hex */);
         val_slice = formatted_value;
+      } else if (is_value_proto_) {
+        val_slice = ProtoToJson(val_slice.ToString(false));
       }
 
       fprintf(stdout, "%.*s : %.*s\n", static_cast<int>(key_slice.size()),
@@ -2486,7 +2512,7 @@ PutCommand::PutCommand(const std::vector<std::string>& params,
                        const std::vector<std::string>& flags)
     : LDBCommand(options, flags, false,
                  BuildCmdLineOptions({ARG_TTL, ARG_HEX, ARG_KEY_HEX,
-                                      ARG_VALUE_HEX, ARG_CREATE_IF_MISSING})) {
+                                      ARG_VALUE_HEX, ARG_CREATE_IF_MISSING, ARG_PROTO, ARG_PROTO_FILE})) {
   if (params.size() != 2) {
     exec_state_ = LDBCommandExecuteResult::Failed(
         "<key> and <value> must be specified for the put command");
@@ -2501,6 +2527,8 @@ PutCommand::PutCommand(const std::vector<std::string>& params,
 
   if (is_value_hex_) {
     value_ = HexToString(value_);
+  } else if (is_value_proto_) {
+    value_ = JsonToProto(value_);
   }
   create_if_missing_ = IsFlagPresent(flags_, ARG_CREATE_IF_MISSING);
 }
@@ -2510,6 +2538,8 @@ void PutCommand::Help(std::string& ret) {
   ret.append(PutCommand::Name());
   ret.append(" <key> <value> ");
   ret.append(" [--" + ARG_TTL + "]");
+  ret.append(" [--" + ARG_PROTO + "]");
+  ret.append(" [--" + ARG_PROTO_FILE + "]");
   ret.append("\n");
 }
 
@@ -2598,7 +2628,13 @@ void DBQuerierCommand::DoCommand() {
       fprintf(stdout, "Successfully deleted %s\n", tokens[1].c_str());
     } else if (cmd == PUT_CMD && tokens.size() == 3) {
       key = (is_key_hex_ ? HexToString(tokens[1]) : tokens[1]);
-      value = (is_value_hex_ ? HexToString(tokens[2]) : tokens[2]);
+      if (is_value_hex_) {
+        value = HexToString(tokens[2]);
+      } else if(is_value_proto_) {
+        value = JsonToProto(tokens[2]);
+      } else {
+        value = tokens[2];
+      }
       db_->Put(write_options, GetCfHandle(), Slice(key), Slice(value));
       fprintf(stdout, "Successfully put %s %s\n",
               tokens[1].c_str(), tokens[2].c_str());
@@ -2606,7 +2642,7 @@ void DBQuerierCommand::DoCommand() {
       key = (is_key_hex_ ? HexToString(tokens[1]) : tokens[1]);
       if (db_->Get(read_options, GetCfHandle(), Slice(key), &value).ok()) {
         fprintf(stdout, "%s\n", PrintKeyValue(key, value,
-              is_key_hex_, is_value_hex_).c_str());
+              is_key_hex_, is_value_hex_, is_value_proto_).c_str());
       } else {
         fprintf(stdout, "Not found %s\n", tokens[1].c_str());
       }

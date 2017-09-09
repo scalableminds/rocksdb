@@ -57,12 +57,11 @@ else()
     endif()
   endif()
 
-  option(WITH_PROTOBUF "build with ProtocolBuffers" ON)
-  if (WITH_PROTOBUF)
-    find_package(Protobuf REQUIRED)
-    include_directories(${Protobuf_INCLUDE_DIRS})
-    list(APPEND THIRDPARTY_LIBS Protobuf)
-  endif()
+  find_package(Protobuf REQUIRED)
+  include_directories(${Protobuf_INCLUDE_DIRS})
+  list(APPEND THIRDPARTY_LIBS protobuf)
+
+  list(APPEND THIRDPARTY_LIBS json2pb)
 
   option(WITH_SNAPPY "build with SNAPPY" OFF)
   if(WITH_SNAPPY)

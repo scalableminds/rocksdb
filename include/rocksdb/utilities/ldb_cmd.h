@@ -16,6 +16,9 @@
 #include <string>
 #include <vector>
 
+#include <google/protobuf/compiler/importer.h>
+#include <google/protobuf/dynamic_message.h>
+
 #include "rocksdb/env.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/ldb_tool.h"
@@ -81,6 +84,8 @@ class LDBCommand {
 
   bool ValidateCmdLineOptions();
 
+  void PrepareProtobufMessage();
+
   virtual Options PrepareOptionsForOpenDB();
 
   virtual void SetDBOptions(Options options) { options_ = options; }
@@ -111,13 +116,17 @@ class LDBCommand {
 
   void ClearPreviousRunState() { exec_state_.Reset(); }
 
-  // Consider using Slice::DecodeHex directly instead if you don't need the
-  // 0x prefix
-  static std::string HexToString(const std::string& str);
+    // Consider using Slice::DecodeHex directly instead if you don't need the
+    // 0x prefix
+    static std::string HexToString(const std::string& str);
 
-  // Consider using Slice::ToString(true) directly instead if
+    // Consider using Slice::ToString(true) directly instead if
   // you don't need the 0x prefix
   static std::string StringToHex(const std::string& str);
+
+  std::string ProtoToJson(const std::string& str);
+
+  std::string JsonToProto(const std::string& str);
 
   static const char* DELIM;
 
@@ -128,6 +137,12 @@ class LDBCommand {
   DB* db_;
   DBWithTTL* db_ttl_;
   std::map<std::string, ColumnFamilyHandle*> cf_handles_;
+
+  std::shared_ptr<google::protobuf::compiler::Importer> proto_importer_;
+  const google::protobuf::FileDescriptor *proto_file_descriptor_;
+  const google::protobuf::Descriptor *proto_descriptor_;
+  google::protobuf::DynamicMessageFactory proto_message_factory_;
+  std::shared_ptr<google::protobuf::Message> proto_message_;
 
   /**
    * true implies that this command can work if the db is opened in read-only
@@ -140,6 +155,15 @@ class LDBCommand {
 
   /** If true, the value is input/output as hex in get/put/scan/delete etc. */
   bool is_value_hex_;
+
+  /** If true, the value is input/output as json formatted proto in get/put/scan/delete etc. */
+  bool is_value_proto_;
+
+  /** Name of the proto message */
+  std::string proto_;
+
+  /** File containing the proto message deinition */
+  std::string proto_file_;
 
   /** If true, the value is treated as timestamp suffixed */
   bool is_db_ttl_;
@@ -168,7 +192,7 @@ class LDBCommand {
   const std::vector<std::string> valid_cmd_line_options_;
 
   bool ParseKeyValue(const std::string& line, std::string* key,
-                     std::string* value, bool is_key_hex, bool is_value_hex);
+                     std::string* value, bool is_key_hex, bool is_value_hex, bool is_value_proto);
 
   LDBCommand(const std::map<std::string, std::string>& options,
              const std::vector<std::string>& flags, bool is_read_only,
@@ -180,12 +204,9 @@ class LDBCommand {
 
   ColumnFamilyHandle* GetCfHandle();
 
-  static std::string PrintKeyValue(const std::string& key,
-                                   const std::string& value, bool is_key_hex,
-                                   bool is_value_hex);
-
-  static std::string PrintKeyValue(const std::string& key,
-                                   const std::string& value, bool is_hex);
+  std::string PrintKeyValue(const std::string& key,
+                            const std::string& value, bool is_key_hex,
+                            bool is_value_hex, bool is_value_proto);
 
   /**
    * Return true if the specified flag is present in the specified flags vector
@@ -211,8 +232,6 @@ class LDBCommand {
 
   bool ParseStringOption(const std::map<std::string, std::string>& options,
                          const std::string& option, std::string* value);
-
-  bool ParseProtobuf(const std::string &proto, const std::string &proto_file, const Slice &slice, std::string &result);
 
   Options options_;
   std::vector<ColumnFamilyDescriptor> column_families_;
